@@ -1,0 +1,71 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 0. Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Primitive Helpers
+    function isSignedIn() { return request.auth != null; }
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+    function isValidId(id) { 
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); 
+    }
+
+    // Validation Helpers
+    function isValidUser(data) {
+      return data.keys().hasAll(['email', 'createdAt']) && 
+             data.keys().size() == 2 && 
+             data.email is string && data.email.size() <= 200 &&
+             data.createdAt is number;
+    }
+
+    function isValidJobCreate(data) {
+      return data.keys().hasAll(['userId', 'url', 'status', 'createdAt', 'updatedAt']) &&
+             data.userId == request.auth.uid &&
+             data.url is string && data.url.size() <= 1000 &&
+             data.status == 'pending' &&
+             data.createdAt is number && data.createdAt >= request.time.toMillis() - 300000 && data.createdAt <= request.time.toMillis() + 300000 &&
+             data.updatedAt is number && data.updatedAt >= request.time.toMillis() - 300000 && data.updatedAt <= request.time.toMillis() + 300000 &&
+             (!('error' in data) || (data.error is string && data.error.size() <= 1000)) &&
+             (!('shorts' in data) || (data.shorts is list && data.shorts.size() <= 50));
+    }
+
+    function isValidJobUpdate(data) {
+      return data.userId == request.auth.uid &&
+             data.url is string && data.url.size() <= 1000 &&
+             data.status is string && data.status.size() <= 20 &&
+             data.createdAt is number &&
+             data.updatedAt is number && data.updatedAt >= request.time.toMillis() - 300000 && data.updatedAt <= request.time.toMillis() + 300000 &&
+             (!('error' in data) || (data.error is string && data.error.size() <= 1000)) &&
+             (!('shorts' in data) || (data.shorts is list && data.shorts.size() <= 50));
+    }
+
+    // Collections
+    match /users/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && request.auth.uid == userId;
+      allow create: if isSignedIn() && isValidId(userId) && request.auth.uid == userId && isValidUser(incoming());
+      allow update: if isSignedIn() && isValidId(userId) && request.auth.uid == userId && 
+                    isValidUser(incoming()) && 
+                    incoming().createdAt == existing().createdAt &&
+                    incoming().diff(existing()).affectedKeys().hasOnly(['email']);
+      allow list: if false;
+      allow delete: if false;
+    }
+
+    match /jobs/{jobId} {
+      allow get: if isSignedIn() && isValidId(jobId) && existing().userId == request.auth.uid;
+      allow list: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow create: if isSignedIn() && isValidId(jobId) && isValidJobCreate(incoming());
+      allow update: if isSignedIn() && isValidId(jobId) && existing().userId == request.auth.uid && 
+                    isValidJobUpdate(incoming()) &&
+                    incoming().userId == existing().userId &&
+                    incoming().createdAt == existing().createdAt &&
+                    incoming().url == existing().url &&
+                    incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt', 'shorts', 'error']);
+      allow delete: if isSignedIn() && isValidId(jobId) && existing().userId == request.auth.uid;
+    }
+  }
+}

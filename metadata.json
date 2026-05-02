@@ -1,0 +1,6 @@
+{
+  "name": "AutoShorts SaaS",
+  "description": "A SaaS web app that automates cutting shorts from a video using React, Firebase, and Gemini 1.5 API.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}

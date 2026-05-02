@@ -1,0 +1,43 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User profile data",
+      "type": "object",
+      "properties": {
+        "email": { "type": "string" },
+        "createdAt": { "type": "number", "description": "Timestamp" }
+      },
+      "required": ["email", "createdAt"]
+    },
+    "Job": {
+      "title": "Job",
+      "description": "Video processing job to extract shorts",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "url": { "type": "string", "description": "YouTube video URL" },
+        "status": { "type": "string", "enum": ["pending", "processing", "completed", "error"] },
+        "shorts": { 
+          "type": "array", 
+          "description": "Extracted shorts data",
+          "items": { "type": "object" } 
+        },
+        "error": { "type": "string" },
+        "createdAt": { "type": "number" },
+        "updatedAt": { "type": "number" }
+      },
+      "required": ["userId", "url", "status", "createdAt", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/User" },
+      "description": "User profiles"
+    },
+    "/jobs/{jobId}": {
+      "schema": { "$ref": "#/entities/Job" },
+      "description": "Video processing jobs"
+    }
+  }
+}
