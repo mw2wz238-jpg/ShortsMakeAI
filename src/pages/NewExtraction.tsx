@@ -1,20 +1,23 @@
-import React, { useState, useContext, useEffect } from 'react';
+import React, { useState, useContext, useEffect, useCallback } from 'react';
 import { AuthContext } from '../AuthContext';
-import { db } from '../firebase';
+import { db, storage } from '../firebase';
 import { doc, setDoc, updateDoc } from 'firebase/firestore';
+import { ref, uploadBytesResumable, getDownloadURL } from 'firebase/storage';
 import { useNavigate } from 'react-router-dom';
-import { Video, Loader2, Settings2, Scissors, Sparkles, Languages } from 'lucide-react';
+import { Video, Loader2, Settings2, Scissors, Sparkles, Languages, UploadCloud } from 'lucide-react';
+import { useDropzone } from 'react-dropzone';
 import toast from 'react-hot-toast';
 import { cn } from '../lib/utils';
 import { JobSettings } from '../types';
-import { GoogleGenAI, Type } from '@google/genai';
 import { useTranslation } from 'react-i18next';
 
 export default function NewExtraction() {
   const { user } = useContext(AuthContext);
   const navigate = useNavigate();
   const { t, i18n } = useTranslation();
-  const [url, setUrl] = useState('');
+  
+  const [file, setFile] = useState<File | null>(null);
+  const [uploadProgress, setUploadProgress] = useState<number>(0);
   const [isSubmitting, setIsSubmitting] = useState(false);
   
   const [settings, setSettings] = useState<JobSettings>({
@@ -28,30 +31,61 @@ export default function NewExtraction() {
     setSettings(s => ({ ...s, outputLanguage: i18n.language }));
   }, [i18n.language]);
 
+  const onDrop = useCallback((acceptedFiles: File[]) => {
+    if (acceptedFiles.length > 0) setFile(acceptedFiles[0]);
+  }, []);
+
+  const { getRootProps, getInputProps, isDragActive } = useDropzone({
+    onDrop,
+    accept: { 'video/*': [] },
+    maxFiles: 1
+  });
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!user || !url) return;
+    if (!user || !file) return;
     setIsSubmitting(true);
     
     const jobId = crypto.randomUUID();
     const now = Date.now();
     
     try {
+      // 1. First, upload to Firebase Storage
+      const storageRef = ref(storage, `raw_videos/${user.uid}/${jobId}_${file.name}`);
+      const uploadTask = uploadBytesResumable(storageRef, file);
+
+      const downloadUrl = await new Promise<string>((resolve, reject) => {
+        uploadTask.on('state_changed', 
+          (snapshot) => {
+            const progress = (snapshot.bytesTransferred / snapshot.totalBytes) * 100;
+            setUploadProgress(progress);
+          }, 
+          (error) => reject(error), 
+          async () => {
+            const url = await getDownloadURL(uploadTask.snapshot.ref);
+            resolve(url);
+          }
+        );
+      });
+      
+      // 2. Initialize Firestore Job
       await setDoc(doc(db, 'jobs', jobId), {
         userId: user.uid,
-        url,
+        url: downloadUrl, // Using the Storage url
+        fileName: file.name,
         status: 'pending',
         settings,
         createdAt: now,
         updatedAt: now,
       });
 
-      toast.loading(t('extracting'), { id: jobId });
+      toast.loading(t('extracting', 'Analiza wideo przez AI...'), { id: jobId });
 
+      // 3. Call Backend for AI Analysis
       const response = await fetch('/api/functions/extract-shorts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ videoUrl: url, settings: settings })
+        body: JSON.stringify({ videoUrl: downloadUrl, fileName: file.name, settings })
       });
 
       if (!response.ok) {
@@ -59,113 +93,7 @@ export default function NewExtraction() {
         throw new Error(errBody.error || t('extraction_failed'));
       }
 
-      const { transcriptText } = await response.json();
-
-      const platformMap: Record<string, string> = {
-        tiktok: 'TikTok (fast-paced, highly engaging hooks)',
-        youtube_shorts: 'YouTube Shorts (attention-grabbing, algorithmic focus)',
-        reels: 'Instagram Reels (aesthetic, relatable or educational)'
-      };
-
-      const durationMap: Record<string, string> = {
-        under_60s: 'Maximum 60 seconds per segment',
-        under_30s: 'Maximum 30 seconds per segment',
-        any: 'Any suitable length'
-      };
-
-      const focusMap: Record<string, string> = {
-        humor: 'funny moments, jokes, and reactions',
-        educational: 'insightful explanations, tutorials, and facts',
-        engaging_hook: 'strong opening hooks, controversies, and story peaks',
-        any: 'the generally best moments'
-      };
-
-      const outLang = settings.outputLanguage || 'en';
-
-      const prompt = `Identify the 3 most engaging segments of this video optimized for ${platformMap[settings.targetPlatform as keyof typeof platformMap] || platformMap.tiktok}. 
-Focus primarily on finding ${focusMap[settings.focus as keyof typeof focusMap] || focusMap.engaging_hook}. 
-Constraint: ${durationMap[settings.durationLimit as keyof typeof durationMap] || durationMap.under_60s}.
-Provide exact start/end timestamps (in seconds) and justify why they are engaging. 
-CRITICAL: The generated \`title\` and \`description\` properties in the JSON response MUST be written in the following language: ${outLang}.
-
-UNIQUE REQUIREMENT: You are also the "Viral Architect" and "Precision Editor". For each segment, you must provide:
-1. viralScore: A score from 0-100 indicating viral potential.
-2. newHookScript: A punchy 3-second script (written in ${outLang}) that the user can dub over the beginning of the video replacing the original intro to maximize retention.
-3. retentionHacks: An array of 3 specific editing instructions (e.g. ['Add zoom', 'Split screen with Subway Surfers']) to keep Gen Z attention.
-4. crop_x_center: A number from 0.0 to 1.0 indicating the horizontal center of the crop for 9:16 format (e.g., 0.5 is perfectly centered).
-5. zoom_points: A timeline of zoom effects. Array of { time, scale } where time is the timestamp relative to the original video and scale is the zoom factor (1.0 is default).
-6. captions: A highly detailed array of { start, end, text } containing precise timestamps for each word or phrase spoken in the segment. Create at least 3-4 captions minimum if there is speech.
-
-A transcript constraint:
-${transcriptText ? transcriptText.substring(0, 30000) : "No transcript available. Please analyze the video's content natively using the provided URL."}
-
-Url: ${url}`;
-
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-      let aiResponse;
-      try {
-        aiResponse = await ai.models.generateContent({
-        model: 'gemini-3.1-pro-preview',
-        contents: prompt,
-        config: {
-          systemInstruction: "You are an expert video editor and social media manager. You have access to YouTube videos if the user provides a link. Return pure JSON array of segments.",
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                title: { type: Type.STRING },
-                start: { type: Type.NUMBER },
-                end: { type: Type.NUMBER },
-                description: { type: Type.STRING },
-                viralScore: { type: Type.NUMBER },
-                newHookScript: { type: Type.STRING },
-                retentionHacks: {
-                  type: Type.ARRAY,
-                  items: { type: Type.STRING }
-                },
-                crop_x_center: { type: Type.NUMBER },
-                zoom_points: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      time: { type: Type.NUMBER },
-                      scale: { type: Type.NUMBER }
-                    },
-                    required: ["time", "scale"]
-                  }
-                },
-                captions: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      start: { type: Type.NUMBER },
-                      end: { type: Type.NUMBER },
-                      text: { type: Type.STRING }
-                    },
-                    required: ["start", "end", "text"]
-                  }
-                }
-              },
-              required: ["title", "start", "end", "description", "viralScore", "newHookScript", "retentionHacks", "crop_x_center", "zoom_points", "captions"]
-            }
-          }
-        }
-      });
-      } catch (genAiError) {
-        throw new Error(genAiError instanceof Error ? genAiError.message : String(genAiError));
-      }
-      
-      const shortsText = aiResponse.text || "[]";
-      let shorts;
-      try {
-        shorts = JSON.parse(shortsText);
-      } catch (e) {
-        throw new Error("Failed to parse AI response. " + shortsText);
-      }
+      const { shorts } = await response.json();
 
       await updateDoc(doc(db, 'jobs', jobId), {
         status: 'completed',
@@ -186,6 +114,7 @@ Url: ${url}`;
       }).catch(console.error);
     } finally {
       setIsSubmitting(false);
+      setUploadProgress(0);
     }
   };
 
@@ -193,34 +122,48 @@ Url: ${url}`;
     <div className="max-w-3xl space-y-8">
       <div>
         <h1 className="text-3xl font-bold text-slate-900 tracking-tight flex items-center gap-3">
-          <Sparkles className="text-indigo-600" /> {t('new_ext_title')}
+          <Sparkles className="text-indigo-600" /> Profesjonalny Edytor Wideo
         </h1>
-        <p className="text-slate-500 mt-2">{t('new_ext_subtitle')}</p>
+        <p className="text-slate-500 mt-2">Wgraj swój plik z dysku, a AI automatycznie wykadruje i potnie materiał.</p>
       </div>
 
       <div className="bg-white border text-left border-slate-200 shadow-sm rounded-3xl p-6 md:p-10 space-y-8">
         <form onSubmit={handleSubmit} className="space-y-8">
           
           <div className="space-y-4">
-            <label className="block text-sm font-semibold text-slate-900">{t('url_label')}</label>
-            <div className="relative">
-              <div className="absolute inset-y-0 left-4 flex items-center pointer-events-none">
-                <Video className="text-slate-400" size={20} />
+            <label className="block text-sm font-semibold text-slate-900">Wgraj Plik Wideo</label>
+            
+            <div 
+              {...getRootProps()} 
+              className={cn(
+                "border-2 border-dashed rounded-3xl p-12 text-center transition-all cursor-pointer",
+                isDragActive ? "border-indigo-500 bg-indigo-50" : "border-slate-300 hover:border-slate-400 bg-slate-50"
+              )}
+            >
+              <input {...getInputProps()} />
+              <div className="flex flex-col items-center gap-4">
+                <UploadCloud size={48} className={isDragActive ? "text-indigo-600" : "text-slate-400"} />
+                {file ? (
+                  <div className="text-sm font-semibold text-slate-900">{file.name} ({(file.size / 1024 / 1024).toFixed(2)} MB)</div>
+                ) : (
+                  <div>
+                    <div className="text-base font-medium text-slate-900">Przeciągnij i upuść plik wideo tutaj</div>
+                    <div className="text-sm text-slate-500">lub kliknij, żeby przeglądać dysk (MP4, MOV)</div>
+                  </div>
+                )}
               </div>
-              <input
-                type="url"
-                required
-                placeholder="https://www.youtube.com/watch?v=..."
-                value={url}
-                onChange={e => setUrl(e.target.value)}
-                className="block w-full pl-12 pr-4 py-4 bg-slate-50 border border-slate-200 rounded-2xl text-slate-900 placeholder:text-slate-400 focus:bg-white focus:outline-none focus:ring-2 focus:ring-indigo-600/50 transition-all text-base"
-              />
             </div>
+
+            {uploadProgress > 0 && uploadProgress < 100 && (
+               <div className="w-full bg-slate-100 h-2 rounded-full overflow-hidden mt-4">
+                 <div className="bg-indigo-600 h-full transition-all duration-300" style={{ width: `${uploadProgress}%` }}></div>
+               </div>
+            )}
           </div>
 
           <div className="space-y-6 pt-6 border-t border-slate-100">
             <h3 className="text-sm font-semibold text-slate-900 flex items-center gap-2">
-              <Settings2 size={16} /> {t('ai_directives_label')}
+              <Settings2 size={16} /> {t('ai_directives_label', 'Wytyczne Edycji AI')}
             </h3>
             
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
@@ -283,23 +226,20 @@ Url: ${url}`;
           <div className="pt-6">
             <button
               type="submit"
-              disabled={isSubmitting || !url}
+              disabled={isSubmitting || !file}
               className={cn(
                 "w-full py-4 rounded-2xl flex items-center justify-center gap-3 text-lg font-semibold transition-all shadow-sm",
-                isSubmitting || !url 
+                isSubmitting || !file 
                   ? "bg-slate-100 text-slate-400 cursor-not-allowed" 
                   : "bg-indigo-600 hover:bg-indigo-700 text-white hover:shadow-md hover:scale-[1.01]"
               )}
             >
               {isSubmitting ? (
-                <><Loader2 className="animate-spin" /> {t('extracting')}</>
+                <><Loader2 className="animate-spin" /> {uploadProgress > 0 && uploadProgress < 100 ? `Wysyłanie pliku... ${uploadProgress.toFixed(0)}%` : t('extracting', 'Analiza pliku...')}</>
               ) : (
-                <><Scissors /> {t('extract_button')}</>
+                <><Scissors /> Rozpocznij montaż AI</>
               )}
             </button>
-            <p className="text-center text-xs text-slate-400 mt-4">
-              {t('extract_note')}
-            </p>
           </div>
         </form>
       </div>

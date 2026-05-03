@@ -9,6 +9,10 @@ export interface Short {
   crop_x_center?: number;
   zoom_points?: { time: number; scale: number }[];
   captions?: { start: number; end: number; text: string }[];
+  captionColor?: string;
+  captionStyle?: string;
+  watermark?: string | null;
+  filter?: string;
   renderStatus?: 'idle' | 'rendering' | 'finished' | 'error';
   renderProgress?: number;
   finalVideoUrl?: string;
